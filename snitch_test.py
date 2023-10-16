@@ -4,11 +4,13 @@ import time
 import pytest
 import logging
 import re
+import psutil
 
 from cassandra import ConsistencyLevel
 from dtest import Tester, create_ks, create_cf
 from tools.assertions import assert_stderr_clean
 from tools.jmxutils import (JolokiaAgent, make_mbean)
+from threading import Thread
 
 since = pytest.mark.since
 skip = pytest.mark.skip
@@ -211,11 +213,40 @@ class TestGossipingPropertyFileSnitch(Tester):
         node1.mark_log()
         node2.start(wait_for_binary_proto=True, wait_other_notice=False)
         node1.watch_log_for('127.0.0.4:7000 is now UP')
-        node1_mark = node1.mark_log()
-        node2_mark = node2.mark_log()
-        node2.nodetool('rebuild dc1')
-        assert len(node1.grep_log('.*Creating channel id .* local .* remote 127.0.0.4/127.0.0.4:7000', filename='debug.log',from_mark=node1_mark)) > 0
-        assert len(node2.grep_log('.*Creating channel id .* local .* remote 127.0.0.3/127.0.0.3:7000', filename='debug.log',from_mark=node2_mark)) > 0
+        rebuild_thread  = Thread(target=run_nodetool_in_thread, args=(node2, 'rebuild dc1',))
+        rebuild_thread.start()
+        # Wait for rebuild to start running
+        node2.watch_log_for('rebuild from dc: dc1')
+        # Check active connections while rebuild is running
+        node1_conn_on_wrong_ip = None
+        node2_conn_on_wrong_ip = None
+        while True or node1_conn_on_wrong_ip or node2_conn_on_wrong_ip:
+            n1 = psutil.Process(node1.pid)
+            for conn in n1.connections():
+                try:
+                    if conn.raddr.port == 7000 and conn.raddr.ip == NODE2_LISTEN_ADDRESS:
+                        node1_conn_on_wrong_ip = conn
+                        logger.debug("Node1 conn: {}".format(conn))
+                except AttributeError:
+                    pass
+            n2 = psutil.Process(node2.pid)
+            for conn in n2.connections():
+                try:
+                    if conn.raddr.port == 7000 and conn.raddr.ip == NODE1_LISTEN_ADDRESS:
+                        node2_conn_on_wrong_ip = conn
+                        logger.debug("Node2 conn: {}".format(conn))
+                except AttributeError:
+                    pass
+            if not rebuild_thread.is_alive():
+                break
+        rebuild_thread.join(timeout=60)
+        if rebuild_thread.is_alive():
+            logger.error("Failed to join rebuild thread after 60 seconds")
+            raise
+        assert not node1_conn_on_wrong_ip and not node2_conn_on_wrong_ip
+
+def run_nodetool_in_thread(node, cmd):
+    node.nodetool(cmd)
 
 class TestDynamicEndpointSnitch(Tester):
     @pytest.mark.resource_intensive
